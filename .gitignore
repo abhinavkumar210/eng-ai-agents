@@ -2,6 +2,8 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.pyc
+.ipynb_checkpoints/
 
 # C extensions
 *.so
@@ -35,6 +37,9 @@ MANIFEST
 # Installer logs
 pip-log.txt
 pip-delete-this-directory.txt
+
+# fiftyone (local DB/cache)
+fiftyone/
 
 # Unit test / coverage reports
 htmlcov/
@@ -174,6 +179,7 @@ datafiles/
 runs/
 
 *.pth
+*.pt
 .ipynb_checkpoints
 
 *.tar.xz
