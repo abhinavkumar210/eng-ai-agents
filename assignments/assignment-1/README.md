@@ -10,4 +10,5 @@ Custom Torchvision dataset with Transforms v2
 
 Transform using the astronaut image
 
-Visualization with FiftyOne
+Visualization with FiftyOne on http://localhost:5151/datasets/assignment1_frames
+(Running the last code block)
