@@ -166,7 +166,6 @@ cython_debug/
 
 docs/_site/
 docs/_book/
-data/
 
 logs/
 *.log
