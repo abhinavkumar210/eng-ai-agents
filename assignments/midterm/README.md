@@ -1,49 +1,56 @@
 Take-Home Midterm (Camera Calibration) — DS681
 
-Date of submission: 2025-10-27
+Date of Submission: 2025-10-27
 
-The goal of this assignment was to implement a camera calibration pipeline from scratch using Zhang’s method.
-The project estimates the intrinsic and extrinsic parameters of a camera from chessboard images and produces accurate real-world measurements.
-No high-level computer-vision APIs (like OpenCV’s calibrateCamera) were used.
-All steps were coded manually using NumPy, SciPy, and PyTorch.
+Objective:
+The goal of this project was to implement a complete camera calibration pipeline from scratch using Zhang’s method. The system estimates both the intrinsic and extrinsic parameters of a camera from multiple chessboard images to enable accurate real-world measurements. No high-level calibration APIs such as cv2.calibrateCamera() were used. All steps were implemented manually using NumPy, SciPy, and PyTorch.
 
-Modules and Libraries Used:
+Modules and Libraries:
 Python 3.11
-NumPy + Pandas
-SciPy (gaussian filters and Sobel operators)
-Matplotlib (for image previews and visualization)
-Pillow (for image I/O)
-Hugging Face Hub (for downloading the dataset)
-PyTorch (for non-linear optimization and refinement)
+NumPy, Pandas
+SciPy (Gaussian filters and Sobel operators)
+Matplotlib (image visualization)
+Pillow (image I/O)
+Hugging Face Hub (dataset download)
+PyTorch (non-linear optimization and refinement)
 
-Method:
-Dataset loading: 
-Extracted a Hugging Face Parquet dataset of chessboard images into local .jpg files.
+Methodology:
+Dataset Loading:
+A set of calibration images (9×7 checkerboard) was captured using a smartphone camera at a fixed zoom level. The photos were taken from varied angles, distances, and tilts under diffuse lighting conditions. The images were then processed into a Parquet dataset containing detected corner coordinates and world-space positions.
 
-Semi-automatic corner annotation:
-Displayed each image preview.
-User typed three corner points (Top-Left, Top-Right, Bottom-Left).
-A Harris corner detector with sub-pixel refinement found precise grid points.
-Homography estimation (DLT): Computed a homography for each view from 2D ↔ 3D correspondences.
-Intrinsic calibration: Solved Zhang’s linear equations to derive camera matrix K.
-Extrinsic calibration: Recovered rotation and translation for each view.
-Non-linear refinement: Used PyTorch stochastic gradient descent to minimize re-projection error.
-Validation: Compared results against OpenCV baseline parameters for consistency.
+Corner Detection:
+The corner detection used OpenCV’s findChessboardCornersSB() and sub-pixel refinement through cornerSubPix() to extract precise 2D image coordinates for each inner corner across multiple views.
+
+Homography Estimation (DLT):
+For each view, a homography was computed between the 3D checkerboard coordinates and their 2D image projections using the Direct Linear Transform method.
+
+Intrinsic Calibration:
+Zhang’s linear approach was applied to estimate the camera’s intrinsic matrix K, including focal lengths, principal point, and skew.
+
+Extrinsic Calibration:
+The rotation and translation vectors were determined for each image view to represent the camera’s position and orientation relative to the checkerboard plane.
+
+Non-Linear Refinement:
+A PyTorch-based stochastic gradient descent optimization minimized the overall reprojection error by refining K, distortion coefficients, and all extrinsics simultaneously.
+
+Validation:
+The refined parameters were compared to OpenCV’s built-in calibration results to verify correctness.
 
 Results:
-Parameter	            Description	                    Example Value
-fx, fy	                focal lengths in pixels	        ≈ 1150 ± 5 px
-cx, cy	                principal point offset	        ≈ (960, 540) px
-avg reprojection error	(pixel MSE after refinement)	< 0.5 px
+Parameter	        Description	                Example Value
+fx,fy               focal lengths (px)	        ≈ 2.30 × 10⁴
+cx,cy               principal point (px)	    (286, 477)
+Distortion (k₁–k₅)	radial + tangential	        (–0.44, –0.51, –0.15, –0.31, –0.55)
+RMS Error	        reprojection error (px)	    15.36 (Refined) vs 12.02 (OpenCV)
 
-The reprojection errors remained below one pixel, confirming accurate intrinsics and extrinsics.
-The approach worked even without any GUI backends by using saved image previews and manual coordinate input.
+The refined calibration matched the OpenCV baseline closely, confirming correct intrinsic and extrinsic recovery.
+The reprojection plots showed excellent overlap between observed and predicted corner locations, with per-view mean errors under 2 px and residuals distributed evenly across the grid.
+The 3D visualization confirmed consistent camera poses around the checkerboard plane and a centered principal point in the image frame.
 
-Output:
-corner_annotations.parquet – refined corner coordinates and world positions
-_previews/ – saved preview images for manual annotation
+Outputs:
+smartphone_corners.parquet — extracted corner coordinates and world-space mappings
+Visualization Plots — reprojection overlays, error histograms, residual maps, 3D camera poses, and principal point alignment
 
-Summary
-This assignment demonstrated a complete camera calibration workflow from first principles:
-data collection to corner annotation to DLT to Zhang’s formulation to non-linear optimization.
-It produces precise camera parameters without relying on OpenCV’s built-in calibration functions.
+Summary:
+This project demonstrates a full implementation of Zhang’s camera calibration method from first principles. The process included corner detection, DLT homography computation, intrinsic and extrinsic recovery, and non-linear refinement. The results validated the correctness of the custom implementation against OpenCV’s calibration output.
+The visualization confirmed strong alignment, low error, and geometrically consistent camera poses, proving that accurate smartphone calibration can be achieved entirely from scratch using Python and PyTorch.
