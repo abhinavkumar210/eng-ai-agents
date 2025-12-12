@@ -190,7 +190,7 @@ Notebooks:
     - 01_single_image_prototype.ipynb
     - 02_gradio_single_image.ipynb
     - 03_webrtc_bridge.ipynb
-    - 04_Gradio_App.ipynb
+    - 04_gradio_app.ipynb
 
 Makefile Includes:
 make resume — recreate environment
