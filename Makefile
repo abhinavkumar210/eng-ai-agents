@@ -1,12 +1,16 @@
 .PHONY: install install-dev format lint lint-check type-check test test-cov test-examples clean build deps-update deps-sync quality style fixup venv venv-recreate setup-dev docker-build-gpu docker-build-cpu docker-build docker-run-gpu docker-run-cpu ci-quality ci-test
 # Use stage 0 container pip constraints
-CONSTRAINTS := --constraint /etc/pip/constraint.txt
+CONSTRAINTS := 
+#--constraint /etc/pip/constraint.txt
 
 export PYTHONPATH = src
 check_dirs := examples tests src utils
 VENV_DIR := .venv
 VENV_PY := $(VENV_DIR)/bin/python
 UV := /usr/bin/uv
+
+PROJECT_DIR := project
+FRAMES_DIR := $(PROJECT_DIR)/frames
 
 # Create venv with access to system packages (from stage 0 container)
 $(VENV_DIR)/bin/activate:
@@ -120,6 +124,29 @@ docker-run-cpu:
 		-w /workspace \
 		eng-ai-agents:cpu
 
+# --- MongoDB helpers for CUA ---
+mongo-start:
+	docker run -d --name cua-mongo \
+		-p 27017:27017 \
+		-v cua_mongo_data:/data/db \
+		mongo:7
+
+mongo-stop:
+	docker stop cua-mongo || true
+	docker rm cua-mongo || true
+
+mongo-shell:
+	docker exec -it cua-mongo mongosh
+
+# --- WebRTC Receiver ---
+webrtc: venv
+	PYDANTIC_DISABLE_PLUGINS=1 PYTHONNOUSERSITE=1 $(VENV_DIR)/bin/python -m uvicorn project.webrtc_receiver:app --host 0.0.0.0 --port 8000
+
+frames-reset:
+	rm -rf $(FRAMES_DIR)
+	mkdir -p $(FRAMES_DIR)
+	@echo "Frames directory reset."
+
 # Development setup
 setup-dev: install-dev
 	$(VENV_DIR)/bin/pre-commit install
@@ -134,3 +161,16 @@ start:
 	$(MAKE) deps-sync
 	$(MAKE) install
 	@echo "To activate the virtual environment, run: source .venv/bin/activate"
+
+# --- One-command project restore ---
+resume:
+	$(MAKE) venv-recreate
+	-$(MAKE) deps-sync
+	$(MAKE) install
+	-$(MAKE) mongo-start
+	@echo "CUA environment restored (Python side)."
+	@echo "If docker is available on this host, you can also run: make mongo-start"
+	@echo "Next steps:"
+	@echo "  make webrtc"
+	@echo "  run your notebooks / Gradio (port 7861)"
+
