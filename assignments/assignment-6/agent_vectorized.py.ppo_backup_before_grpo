@@ -1,0 +1,369 @@
+import gymnasium as gym
+import torch
+import random
+import numpy as np
+from tqdm import tqdm
+import torch.nn as nn
+import torch.nn.functional as F
+from stable_baselines3.common.atari_wrappers import MaxAndSkipEnv
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+
+
+class ActorCritic(nn.Module):
+    """Neural network for policy (actor) and value (critic) estimation.
+    
+    Architecture:
+        - 2 convolutional layers for feature extraction
+        - Shared hidden layer (256 units)
+        - Separate actor (policy) and critic (value) heads
+    """
+    
+    def __init__(self, nb_actions):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(4, 16, 8, stride=4), 
+            nn.Tanh(),
+            nn.Conv2d(16, 32, 4, stride=2), 
+            nn.Tanh(),
+            nn.Flatten(), 
+            nn.Linear(2592, 256), 
+            nn.Tanh(),
+        )
+        self.actor = nn.Linear(256, nb_actions)
+        self.critic = nn.Linear(256, 1)
+
+    def forward(self, x):
+        """Forward pass returns both policy logits and value estimate."""
+        h = self.head(x)
+        return self.actor(h), self.critic(h)
+
+
+class Environments:
+    """Manages multiple Atari Breakout environments.
+    
+    Features:
+        - Batch processing for efficiency
+        - Pre-allocated numpy arrays to avoid repeated allocations
+        - Handles life-based episode termination
+        - Fire action on episode reset
+    """
+    
+    def __init__(self, nb_actor):
+        self.nb_actor = nb_actor
+        self.envs = [self.get_env() for _ in range(nb_actor)]
+        
+        # Pre-allocate observation buffers (4 frames per observation after FrameStack)
+        self.observations = np.zeros((nb_actor, 4, 84, 84), dtype=np.float32)
+        self.current_life = np.zeros(nb_actor, dtype=np.int32)
+        self.done = np.zeros(nb_actor, dtype=bool)
+        self.total_rewards = np.zeros(nb_actor, dtype=np.float32)
+        
+        for env_id in range(nb_actor):
+            self.reset_env(env_id)
+
+    def len(self):
+        """Return number of environments."""
+        return self.nb_actor
+
+    def reset_env(self, env_id):
+        """Reset a single environment with initial no-op and fire actions."""
+        self.total_rewards[env_id] = 0
+        obs, info = self.envs[env_id].reset()
+        
+        # Perform random no-op and fire to initialize environment
+        for _ in range(random.randint(1, 30)):
+            obs, reward, terminated, truncated, info = self.envs[env_id].step(1)
+            self.total_rewards[env_id] += reward
+            self.current_life[env_id] = info['lives']
+        
+        self.observations[env_id] = np.array(obs, dtype=np.float32)
+        self.done[env_id] = False
+
+    def step_batch(self, actions):
+        """Step all environments with minimal Python overhead.
+        
+        Args:
+            actions: numpy array of actions for each environment
+            
+        Returns:
+            rewards: numpy array of rewards
+            dones: numpy array of episode termination flags
+        """
+        rewards = np.empty(self.nb_actor, dtype=np.float32)
+        dones = np.empty(self.nb_actor, dtype=bool)
+        
+        for env_id in range(self.nb_actor):
+            action = int(actions[env_id])
+            next_obs, reward, terminated, truncated, info = self.envs[env_id].step(action)
+            
+            self.observations[env_id] = next_obs
+            self.done[env_id] = terminated or truncated
+            self.total_rewards[env_id] += reward
+            self.current_life[env_id] = info['lives']
+            
+            rewards[env_id] = reward
+            dones[env_id] = self.done[env_id]
+        
+        return rewards, dones
+
+    def get_observations_batch(self, device):
+        """Get all observations as normalized GPU tensor.
+        
+        Args:
+            device: torch device (cuda or cpu)
+            
+        Returns:
+            Normalized observations tensor of shape (nb_actor, 4, 84, 84)
+        """
+        obs_normalized = self.observations.astype(np.float32) / 255.0
+        return torch.from_numpy(obs_normalized).to(device, non_blocking=True)
+
+    def get_env(self):
+        """Create a single Atari Breakout environment with wrappers."""
+        env = gym.make("BreakoutNoFrameskip-v4")
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayScaleObservation(env)
+        env = gym.wrappers.FrameStack(env, 4)
+        env = MaxAndSkipEnv(env, skip=4)
+        return env
+
+
+def PPO(envs, actorcritic, T=32, K=1, batch_size=64, gamma=0.99, device='cuda', 
+        gae_parameter=0.95, vf_coeff_c1=1, ent_coef_c2=0.01, nb_iterations=80):
+    """Proximal Policy Optimization training loop.
+    
+    Args:
+        envs: Environments manager
+        actorcritic: Actor-Critic neural network
+        T: Rollout length (steps per iteration)
+        K: Number of training epochs per iteration
+        batch_size: Training batch size
+        gamma: Discount factor
+        device: torch device (cuda or cpu)
+        gae_parameter: GAE lambda parameter
+        vf_coeff_c1: Value function loss coefficient
+        ent_coef_c2: Entropy bonus coefficient
+        nb_iterations: Total training iterations
+    """
+
+    optimizer = torch.optim.Adam(actorcritic.parameters(), lr=2.5e-4)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1., end_factor=0.0, total_iters=nb_iterations)
+
+    # Initialize tensorboard writer
+    writer = SummaryWriter('runs/breakout_ppo')
+    
+    # Create checkpoint directory
+    import os
+    checkpoint_dir = 'runs/breakout_ppo/checkpoints'
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    
+    max_reward = 0
+    total_rewards = [[] for _ in range(envs.len())]
+    smoothed_rewards = [[] for _ in range(envs.len())]
+    
+    # Pre-allocate buffers on GPU for better performance
+    nb_envs = envs.len()
+    buffer_states = torch.zeros((nb_envs, T, 4, 84, 84), dtype=torch.float32, device=device)
+    buffer_actions = torch.zeros((nb_envs, T), dtype=torch.long, device=device)
+    buffer_logprobs = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+    buffer_state_values = torch.zeros((nb_envs, T+1), dtype=torch.float32, device=device)
+    buffer_rewards = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+    buffer_is_terminal = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+    advantages = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+
+    for iteration in tqdm(range(nb_iterations)):
+        # Reset buffers for this iteration
+        buffer_states.zero_()
+        buffer_actions.zero_()
+        buffer_logprobs.zero_()
+        buffer_state_values.zero_()
+        buffer_rewards.zero_()
+        buffer_is_terminal.zero_()
+        advantages.zero_()
+
+        # ==================== ROLLOUT COLLECTION ====================
+        actorcritic.eval()
+        with torch.no_grad():
+            for t in range(T):
+                # Batch inference: get policy and value for all environments at once
+                obs_batch = envs.get_observations_batch(device)
+                logits_batch, values_batch = actorcritic(obs_batch)
+                
+                # Sample actions for all environments
+                m = torch.distributions.categorical.Categorical(logits=logits_batch)
+                actions_batch = m.sample()
+                log_probs_batch = m.log_prob(actions_batch)
+                
+                # Special handling: use "fire" action (1) for done environments
+                actions_batch_np = actions_batch.cpu().numpy()
+                for env_id in range(nb_envs):
+                    if envs.done[env_id]:
+                        actions_batch_np[env_id] = 1
+                
+                # Store experiences in buffers
+                buffer_states[:, t] = obs_batch
+                buffer_actions[:, t] = torch.from_numpy(actions_batch_np).to(device)
+                buffer_logprobs[:, t] = log_probs_batch
+                buffer_state_values[:, t] = values_batch.squeeze(-1)
+                
+                # Execute actions in all environments
+                rewards, dones = envs.step_batch(actions_batch_np)
+                
+                # Convert to GPU tensors
+                rewards_tensor = torch.from_numpy(np.sign(rewards)).to(device, non_blocking=True)
+                dones_tensor = torch.from_numpy(dones.astype(np.float32)).to(device, non_blocking=True)
+                
+                buffer_rewards[:, t] = rewards_tensor
+                buffer_is_terminal[:, t] = dones_tensor
+                
+                # Track completed episodes and save best models
+                for env_id in range(nb_envs):
+                    if dones[env_id]:
+                        if envs.total_rewards[env_id] > max_reward:
+                            max_reward = envs.total_rewards[env_id]
+                            torch.save(actorcritic.state_dict(), 
+                                      f"{checkpoint_dir}/actorcritic_{int(max_reward)}.pt")
+                            torch.save(actorcritic, 
+                                      f"{checkpoint_dir}/actorcritic_{int(max_reward)}")
+                        
+                        total_rewards[env_id].append(envs.total_rewards[env_id])
+                        envs.reset_env(env_id)
+            
+            # Compute bootstrap value for GAE
+            final_obs_batch = envs.get_observations_batch(device)
+            _, final_values_batch = actorcritic(final_obs_batch)
+            buffer_state_values[:, T] = final_values_batch.squeeze(-1)
+            
+            # Compute advantages using Generalized Advantage Estimation (GAE)
+            for env_id in range(nb_envs):
+                for t in range(T-1, -1, -1):
+                    next_non_terminal = 1.0 - buffer_is_terminal[env_id, t]
+                    delta_t = (buffer_rewards[env_id, t] + 
+                              gamma * buffer_state_values[env_id, t+1] * next_non_terminal - 
+                              buffer_state_values[env_id, t])
+                    if t == (T-1):
+                        A_t = delta_t
+                    else:
+                        A_t = delta_t + gamma * gae_parameter * advantages[env_id, t+1] * next_non_terminal
+                    advantages[env_id, t] = A_t
+
+        # ==================== TENSORBOARD LOGGING ====================
+        if (iteration % 5 == 0) and iteration > 0:
+            for env_id in range(nb_envs):
+                if len(total_rewards[env_id]) > 0:
+                    avg_reward = np.mean(total_rewards[env_id])
+                    smoothed_rewards[env_id].append(avg_reward)
+                    writer.add_scalar(f'Average_Reward/env_{env_id}', avg_reward, iteration)
+            
+            all_rewards = [r for env_rewards in total_rewards for r in env_rewards]
+            if len(all_rewards) > 0:
+                writer.add_scalar('Average_Reward/all_envs', np.mean(all_rewards), iteration)
+            
+            total_rewards = [[] for _ in range(nb_envs)]
+
+        # ==================== POLICY OPTIMIZATION ====================
+        actorcritic.train()
+        for epoch in range(K):
+            # Flatten buffers for training
+            advantages_flat = advantages.reshape(-1)
+            states_flat = buffer_states.reshape(-1, 4, 84, 84)
+            actions_flat = buffer_actions.reshape(-1)
+            logprobs_flat = buffer_logprobs.reshape(-1)
+            values_flat = buffer_state_values[:, :T].reshape(-1)
+            
+            # Create mini-batches
+            dataset = TensorDataset(
+                advantages_flat, states_flat, actions_flat, logprobs_flat, values_flat
+            )
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
+                                   pin_memory=False, num_workers=0)
+            
+            for batch in dataloader:
+                b_adv, obs, action_taken, old_log_prob, old_state_values = batch
+                
+                # Forward pass
+                logits, value = actorcritic(obs)
+                value = value.squeeze(-1)
+                
+                # Policy loss with clipping
+                m = torch.distributions.categorical.Categorical(logits=logits)
+                log_prob = m.log_prob(action_taken)
+                ratio = torch.exp(log_prob - old_log_prob)
+                returns = b_adv + old_state_values
+                
+                policy_loss_1 = b_adv * ratio
+                alpha = 1.0 - iteration / nb_iterations
+                clip_range = 0.1 * alpha
+                policy_loss_2 = b_adv * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+                
+                # Value loss with clipping
+                value_loss1 = F.mse_loss(returns, value, reduction='none')
+                value_loss2 = F.mse_loss(returns, 
+                                        torch.clamp(value, old_state_values - clip_range, 
+                                                   old_state_values + clip_range),
+                                        reduction='none')
+                value_loss = torch.max(value_loss1, value_loss2).mean()
+                
+                # Entropy regularization
+                entropy = m.entropy().mean()
+                
+                # Total loss
+                loss = policy_loss + vf_coeff_c1 * value_loss - ent_coef_c2 * entropy
+                
+                # Optimization step
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(actorcritic.parameters(), 0.5)
+                optimizer.step()
+        
+        scheduler.step()
+        
+        # ==================== TRAINING METRICS ====================
+        if iteration % 100 == 0:
+            writer.add_scalar('Training/policy_loss', policy_loss.item(), iteration)
+            writer.add_scalar('Training/value_loss', value_loss.item(), iteration)
+            writer.add_scalar('Training/entropy', entropy.item(), iteration)
+            writer.add_scalar('Training/learning_rate', scheduler.get_last_lr()[0], iteration)
+    
+    writer.close()
+
+
+if __name__ == "__main__":
+    import time
+    device = 'cpu'
+    print(f"Using device: {device}")
+    
+    # ==================== HYPERPARAMETERS ====================
+    nb_actor = 2
+    batch_size = 64  # Increase for better GPU utilization (256=conservative, 512=balanced, 1024=aggressive)
+    
+    print(f"Training with {nb_actor} parallel environments")
+    print(f"Batch size: {batch_size}")
+    
+    # ==================== MEMORY ESTIMATION ====================
+    # Estimate GPU memory usage
+    obs_memory_mb = (batch_size * 4 * 84 * 84 * 4) / (1024 ** 2)  # ~360 MB per batch
+    total_memory_estimate_gb = (obs_memory_mb * 3) / 1024  # 3x for gradients + optimizer
+    
+    print(f"\nEstimated GPU memory per batch: {obs_memory_mb:.1f} MB")
+    print(f"Estimated total memory usage: {total_memory_estimate_gb:.2f} GB")
+    print("Recommendation: Use batch_size = 64 for balanced GPU utilization")
+    print("             or batch_size=1024 if you have 16+ GB VRAM")
+    print("=" * 60)
+    
+    # ==================== ENVIRONMENT SETUP ====================
+    envs = Environments(nb_actor)
+    actorcritic = ActorCritic(envs.envs[0].action_space.n).to(device)
+    
+    print(f"\nModel parameters: {sum(p.numel() for p in actorcritic.parameters()):,}")
+    print("Starting training...\n")
+    
+    start = time.time()
+    PPO(envs, actorcritic, device=device, batch_size=batch_size)
+    end = time.time()
+    
+    print(f"\nTotal training time: {(end-start)/3600:.2f} hours")

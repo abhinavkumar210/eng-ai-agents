@@ -1,0 +1,362 @@
+
+import argparse
+import gymnasium as gym
+import torch
+import random
+import numpy as np
+from tqdm import tqdm
+import torch.nn as nn
+import torch.nn.functional as F
+from stable_baselines3.common.atari_wrappers import MaxAndSkipEnv
+from torch.utils.data import DataLoader, TensorDataset
+from torch.utils.tensorboard import SummaryWriter
+
+
+class ActorCritic(nn.Module):
+    def __init__(self, nb_actions):
+        super().__init__()
+        self.head = nn.Sequential(
+            nn.Conv2d(4, 16, 8, stride=4), 
+            nn.Tanh(),
+            nn.Conv2d(16, 32, 4, stride=2), 
+            nn.Tanh(),
+            nn.Flatten(), 
+            nn.Linear(2592, 256), 
+            nn.Tanh(),
+        )
+        self.actor = nn.Linear(256, nb_actions)
+        self.critic = nn.Linear(256, 1)
+
+    def forward(self, x):
+        h = self.head(x)
+        return self.actor(h), self.critic(h)
+
+
+class Environments:
+    def __init__(self, nb_actor):
+        self.nb_actor = nb_actor
+        self.envs = [self.get_env() for _ in range(nb_actor)]
+        self.observations = np.zeros((nb_actor, 4, 84, 84), dtype=np.float32)
+        self.current_life = np.zeros(nb_actor, dtype=np.int32)
+        self.done = np.zeros(nb_actor, dtype=bool)
+        self.total_rewards = np.zeros(nb_actor, dtype=np.float32)
+
+        for env_id in range(nb_actor):
+            self.reset_env(env_id)
+
+    def len(self):
+        return self.nb_actor
+
+    def reset_env(self, env_id):
+        self.total_rewards[env_id] = 0
+        obs, info = self.envs[env_id].reset()
+
+        for _ in range(random.randint(1, 10)):
+            obs, reward, terminated, truncated, info = self.envs[env_id].step(1)
+            self.total_rewards[env_id] += reward
+            self.current_life[env_id] = info.get('lives', 0)
+
+        self.observations[env_id] = np.array(obs, dtype=np.float32)
+        self.done[env_id] = False
+
+    def step_batch(self, actions):
+        rewards = np.empty(self.nb_actor, dtype=np.float32)
+        dones = np.empty(self.nb_actor, dtype=bool)
+
+        for env_id in range(self.nb_actor):
+            action = int(actions[env_id])
+            next_obs, reward, terminated, truncated, info = self.envs[env_id].step(action)
+
+            lives = info.get('lives', self.current_life[env_id])
+            life_lost = (lives < self.current_life[env_id])
+
+            self.observations[env_id] = next_obs
+            self.total_rewards[env_id] += reward
+            self.current_life[env_id] = lives
+
+            self.done[env_id] = bool(terminated or truncated or life_lost)
+            rewards[env_id] = reward
+            dones[env_id] = self.done[env_id]
+
+        return rewards, dones
+
+    def get_observations_batch(self, device):
+        obs_normalized = self.observations.astype(np.float32) / 255.0
+        return torch.from_numpy(obs_normalized).to(device)
+
+    def get_env(self):
+        env = gym.make("BreakoutNoFrameskip-v4")
+        env = gym.wrappers.RecordEpisodeStatistics(env)
+        env = gym.wrappers.ResizeObservation(env, (84, 84))
+        env = gym.wrappers.GrayScaleObservation(env)
+        env = gym.wrappers.FrameStack(env, 4)
+        env = MaxAndSkipEnv(env, skip=4)
+        return env
+
+
+def PPO(envs, actorcritic, T=32, K=1, batch_size=64, gamma=0.99, device='cpu',
+        gae_parameter=0.95, vf_coeff_c1=1.0, ent_coef_c2=0.01, nb_iterations=80,
+        logdir='runs/breakout_ppo', log_interval=5):
+
+    optimizer = torch.optim.Adam(actorcritic.parameters(), lr=2.5e-4)
+    scheduler = torch.optim.lr_scheduler.LinearLR(
+        optimizer, start_factor=1., end_factor=0.0, total_iters=nb_iterations)
+
+    writer = SummaryWriter(logdir)
+
+    nb_envs = envs.len()
+    buffer_states = torch.zeros((nb_envs, T, 4, 84, 84), dtype=torch.float32, device=device)
+    buffer_actions = torch.zeros((nb_envs, T), dtype=torch.long, device=device)
+    buffer_logprobs = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+    buffer_state_values = torch.zeros((nb_envs, T+1), dtype=torch.float32, device=device)
+    buffer_rewards = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+    buffer_is_terminal = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+    advantages = torch.zeros((nb_envs, T), dtype=torch.float32, device=device)
+
+    total_rewards = [[] for _ in range(nb_envs)]
+
+    for iteration in tqdm(range(nb_iterations)):
+        buffer_states.zero_()
+        buffer_actions.zero_()
+        buffer_logprobs.zero_()
+        buffer_state_values.zero_()
+        buffer_rewards.zero_()
+        buffer_is_terminal.zero_()
+        advantages.zero_()
+
+        actorcritic.eval()
+        with torch.no_grad():
+            for t in range(T):
+                obs_batch = envs.get_observations_batch(device)
+                logits_batch, values_batch = actorcritic(obs_batch)
+
+                m = torch.distributions.categorical.Categorical(logits=logits_batch)
+                actions_batch = m.sample()
+                log_probs_batch = m.log_prob(actions_batch)
+
+                actions_batch_np = actions_batch.cpu().numpy()
+                for env_id in range(nb_envs):
+                    if envs.done[env_id]:
+                        actions_batch_np[env_id] = 1
+
+                buffer_states[:, t] = obs_batch
+                buffer_actions[:, t] = torch.from_numpy(actions_batch_np).to(device)
+                buffer_logprobs[:, t] = log_probs_batch
+                buffer_state_values[:, t] = values_batch.squeeze(-1)
+
+                rewards, dones = envs.step_batch(actions_batch_np)
+                rewards_tensor = torch.from_numpy(np.sign(rewards)).to(device)
+                dones_tensor = torch.from_numpy(dones.astype(np.float32)).to(device)
+
+                buffer_rewards[:, t] = rewards_tensor
+                buffer_is_terminal[:, t] = dones_tensor
+
+                for env_id in range(nb_envs):
+                    if dones[env_id]:
+                        total_rewards[env_id].append(envs.total_rewards[env_id])
+                        envs.reset_env(env_id)
+
+            final_obs_batch = envs.get_observations_batch(device)
+            _, final_values_batch = actorcritic(final_obs_batch)
+            buffer_state_values[:, T] = final_values_batch.squeeze(-1)
+
+            for env_id in range(nb_envs):
+                for t in range(T-1, -1, -1):
+                    next_non_terminal = 1.0 - buffer_is_terminal[env_id, t]
+                    delta_t = buffer_rewards[env_id, t] + gamma * buffer_state_values[env_id, t+1] * next_non_terminal - buffer_state_values[env_id, t]
+                    if t == (T-1):
+                        A_t = delta_t
+                    else:
+                        A_t = delta_t + gamma * gae_parameter * advantages[env_id, t+1] * next_non_terminal
+                    advantages[env_id, t] = A_t
+
+        if (iteration % log_interval == 0) and iteration > 0:
+            all_rewards = [r for env_rewards in total_rewards for r in env_rewards]
+            if len(all_rewards) > 0:
+                writer.add_scalar('Average_Reward/all_envs', float(np.mean(all_rewards)), iteration)
+            total_rewards = [[] for _ in range(nb_envs)]
+
+        actorcritic.train()
+        for epoch in range(K):
+            advantages_flat = advantages.reshape(-1)
+            states_flat = buffer_states.reshape(-1, 4, 84, 84)
+            actions_flat = buffer_actions.reshape(-1)
+            logprobs_flat = buffer_logprobs.reshape(-1)
+            values_flat = buffer_state_values[:, :T].reshape(-1)
+
+            dataset = TensorDataset(advantages_flat, states_flat, actions_flat, logprobs_flat, values_flat)
+            dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+            for batch in dataloader:
+                b_adv, obs, action_taken, old_log_prob, old_state_values = batch
+                logits, value = actorcritic(obs)
+                value = value.squeeze(-1)
+
+                m = torch.distributions.categorical.Categorical(logits=logits)
+                log_prob = m.log_prob(action_taken)
+                ratio = torch.exp(log_prob - old_log_prob)
+                returns = b_adv + old_state_values
+
+                policy_loss_1 = b_adv * ratio
+                alpha = 1.0 - iteration / nb_iterations
+                clip_range = 0.1 * alpha
+                policy_loss_2 = b_adv * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -torch.min(policy_loss_1, policy_loss_2).mean()
+
+                value_loss1 = F.mse_loss(returns, value, reduction='none')
+                value_loss2 = F.mse_loss(returns, torch.clamp(value, old_state_values - clip_range, old_state_values + clip_range), reduction='none')
+                value_loss = torch.max(value_loss1, value_loss2).mean()
+
+                entropy = m.entropy().mean()
+                loss = policy_loss + vf_coeff_c1 * value_loss - ent_coef_c2 * entropy
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(actorcritic.parameters(), 0.5)
+                optimizer.step()
+
+        scheduler.step()
+
+    writer.close()
+
+
+def GRPO(envs, actorcritic, group_size=4, K=1, batch_size=64, device='cpu',
+         ent_coef=0.01, nb_updates=30, logdir='runs/breakout_grpo', log_interval=1,
+         eps=1e-8):
+
+    optimizer = torch.optim.Adam(actorcritic.parameters(), lr=2.5e-4)
+    writer = SummaryWriter(logdir)
+
+    nb_envs = envs.len()
+    assert nb_envs == group_size, "For this GRPO check, set nb_actor == group_size for simple grouping."
+
+    global_episode_ids = np.zeros(nb_envs, dtype=np.int64)
+    episode_done_once = np.zeros(nb_envs, dtype=bool)
+
+    total_rewards_for_logging = []
+
+    for update in tqdm(range(nb_updates)):
+        traj_obs = [[] for _ in range(nb_envs)]
+        traj_act = [[] for _ in range(nb_envs)]
+        traj_logp = [[] for _ in range(nb_envs)]
+        traj_rew = [[] for _ in range(nb_envs)]
+
+        episode_done_once[:] = False
+
+        actorcritic.eval()
+        with torch.no_grad():
+            while not episode_done_once.all():
+                obs_batch = envs.get_observations_batch(device)
+                logits_batch, _ = actorcritic(obs_batch)  # critic ignored
+                m = torch.distributions.categorical.Categorical(logits=logits_batch)
+                actions_batch = m.sample()
+                log_probs_batch = m.log_prob(actions_batch)
+
+                actions_np = actions_batch.cpu().numpy()
+                for env_id in range(nb_envs):
+                    if envs.done[env_id]:
+                        actions_np[env_id] = 1
+
+                rewards, dones = envs.step_batch(actions_np)
+                rewards = np.sign(rewards).astype(np.float32)
+
+                for env_id in range(nb_envs):
+                    if episode_done_once[env_id]:
+                        continue
+                    traj_obs[env_id].append(obs_batch[env_id].cpu().numpy())
+                    traj_act[env_id].append(int(actions_np[env_id]))
+                    traj_logp[env_id].append(float(log_probs_batch[env_id].cpu().item()))
+                    traj_rew[env_id].append(float(rewards[env_id]))
+
+                    if dones[env_id]:
+                        episode_done_once[env_id] = True
+                        total_rewards_for_logging.append(float(envs.total_rewards[env_id]))
+                        envs.reset_env(env_id)
+
+        returns = np.array([sum(traj_rew[i]) for i in range(nb_envs)], dtype=np.float32)
+        mu = float(returns.mean())
+        sigma = float(np.sqrt(((returns - mu) ** 2).mean() + eps))
+        A = (returns - mu) / sigma
+
+        if update % 1 == 0:
+            print(f"\n[GRPO] update={update} returns={returns.round(2).tolist()} mu={mu:.3f} sigma={sigma:.3f} A={A.round(3).tolist()}")
+
+        flat_obs = []
+        flat_act = []
+        flat_old_logp = []
+        flat_adv = []
+
+        for i in range(nb_envs):
+            for t in range(len(traj_act[i])):
+                flat_obs.append(traj_obs[i][t])
+                flat_act.append(traj_act[i][t])
+                flat_old_logp.append(traj_logp[i][t])
+                flat_adv.append(float(A[i]))
+
+        obs_tensor = torch.tensor(np.array(flat_obs), dtype=torch.float32, device=device)
+        act_tensor = torch.tensor(np.array(flat_act), dtype=torch.long, device=device)
+        old_logp_tensor = torch.tensor(np.array(flat_old_logp), dtype=torch.float32, device=device)
+        adv_tensor = torch.tensor(np.array(flat_adv), dtype=torch.float32, device=device)
+
+        dataset = TensorDataset(obs_tensor, act_tensor, old_logp_tensor, adv_tensor)
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, num_workers=0)
+
+        actorcritic.train()
+        for epoch in range(K):
+            for obs, act, old_logp, adv in loader:
+                logits, _ = actorcritic(obs)
+                m = torch.distributions.categorical.Categorical(logits=logits)
+                logp = m.log_prob(act)
+                ratio = torch.exp(logp - old_logp)
+
+                clip_range = 0.2
+                loss1 = adv * ratio
+                loss2 = adv * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
+                policy_loss = -torch.min(loss1, loss2).mean()
+
+                entropy = m.entropy().mean()
+                loss = policy_loss - ent_coef * entropy
+
+                optimizer.zero_grad(set_to_none=True)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(actorcritic.parameters(), 0.5)
+                optimizer.step()
+
+        if (update % log_interval == 0) and update > 0:
+            if len(total_rewards_for_logging) > 0:
+                writer.add_scalar("Average_Reward/all_envs", float(np.mean(total_rewards_for_logging)), update)
+                total_rewards_for_logging = []
+
+    writer.close()
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--algo", type=str, default="ppo", choices=["ppo", "grpo"])
+    parser.add_argument("--device", type=str, default="cpu", choices=["cpu", "cuda"])
+    parser.add_argument("--nb_actor", type=int, default=4)
+    parser.add_argument("--group_size", type=int, default=4)
+    parser.add_argument("--ppo_iters", type=int, default=80)
+    parser.add_argument("--grpo_updates", type=int, default=30)
+    args = parser.parse_args()
+
+    device = args.device
+    if device == "cuda" and not torch.cuda.is_available():
+        device = "cpu"
+
+    if args.algo == "grpo":
+        nb_actor = args.group_size
+    else:
+        nb_actor = args.nb_actor
+
+    print(f"Using device: {device}")
+    print(f"algo={args.algo} nb_actor={nb_actor} group_size={args.group_size}")
+
+    envs = Environments(nb_actor)
+    actorcritic = ActorCritic(envs.envs[0].action_space.n).to(device)
+
+    if args.algo == "ppo":
+        PPO(envs, actorcritic, device=device, nb_iterations=args.ppo_iters, logdir="runs/breakout_ppo", log_interval=5)
+    else:
+        GRPO(envs, actorcritic, group_size=args.group_size, device=device, nb_updates=args.grpo_updates,
+             logdir="runs/breakout_grpo", log_interval=1)
